@@ -1,0 +1,117 @@
+name: Scan-powershell
+
+on:
+  workflow_dispatch:
+    inputs:
+      do-translation:
+        description: 'Run Fortify translation step'
+        type: boolean
+        default: false
+
+jobs:
+  Scan_Fortify:
+   runs-on: self-hosted
+ 
+    env:
+      FORTIFY_SSC_URL: ${{ vars.FORTIFY_SSC_URL }}  #https://<hostname>:8443/ssc/
+      FORTIFY_SC_URL: ${{ vars.FORTIFY_SC_URL }}    #https://<hostname>:8444/scancentral-ctrl/
+      FORTIFY_BUILD: ${{ vars.FORTIFY_BUILD }}      #Nombre del build
+      FORTIFY_VERID: ${{ vars.FORTIFY_VERID }}      #ID de la aplicacion en Fortify SSC
+    
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Mark workspace as safe for Git
+        shell: powershell
+        run: |
+          git config --global --add safe.directory "${{ github.workspace }}"
+
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Run Fortify Translation
+        if: ${{ github.event.inputs.do-translation == 'true' }}
+        run: |
+          sourceanalyzer -b $env:FORTIFY_BUILD -clean
+          sourceanalyzer -b $env:FORTIFY_BUILD -source 8 .\src
+        shell: powershell
+
+      - name: Run Fortify Scan
+        if: ${{ github.event.inputs.do-translation == 'true' }}
+        run: |
+          $output = scancentral -url $env:FORTIFY_SC_URL start -upload `
+            -versionid $env:FORTIFY_VERID `
+            -uptoken $env:FORTIFY_SC_CRTL_TOKEN `
+            -b $env:FORTIFY_BUILD `
+            -scan | Out-String
+
+          Write-Host "Fortify Scan Output: $output"
+
+          # Usar -match para extraer el token
+          if ($output -match "Submitted job and received token:\s*(\S+)") {
+              $token = $matches[1]
+          } else {
+              $token = "No token found"
+          }
+
+          Write-Host "Token extraido: $token"
+          echo "FORTIFY_JOB_TOKEN=$token" >> $env:GITHUB_ENV
+        env:
+          FORTIFY_SC_CRTL_TOKEN: ${{ secrets.FORTIFY_SC_CRTL_TOKEN }} #ScanCentralCtrlToken de Fortify SSC
+        shell: powershell
+      
+      - name: LogIn Fortify SSC and SC-SAST
+        run: |
+          Write-Host "Logging in to Fortify SSC and SC-SAST"
+          fcli config truststore set -f="C:\Program Files\Fortify\Fortify_SCA_24.2.0\jre\lib\security\cacerts"
+          fcli ssc session login --url $env:FORTIFY_SSC_URL --user $env:FORTIFY_SSC_USER --password $env:FORTIFY_SSC_PASS --sc-sast-url $env:FORTIFY_SSC_URL -c $env:FORTIFY_CLIENT_AUTH_TOKEN --disable sc-dast
+        env:
+          FORTIFY_SSC_USER: ${{ secrets.FORTIFY_SSC_USER }}           #Usuario de Fortify SSC
+          FORTIFY_SSC_PASS: ${{ secrets.FORTIFY_SSC_PASS }}           #Password de Fortify SSC
+          FORTIFY_CI_TOKEN: ${{ secrets.FORTIFY_CI_TOKEN }}
+          FORTIFY_CLIENT_AUTH_TOKEN: ${{ secrets.FORTIFY_CLIENT_AUTH_TOKEN }}   #ClientAuthToken de Fortify SSC - ClientSSC
+        shell: powershell
+
+      - name: Approve Artifact
+        if: ${{ github.event.inputs.do-translation == 'true' }}
+        run: | 
+          Write-Host "Approving Artifact token: ${{env.FORTIFY_JOB_TOKEN}}" 
+
+          fcli sc-sast scan wait-for $env:FORTIFY_JOB_TOKEN
+
+          $artifactId = (fcli ssc artifact list --av=$env:FORTIFY_VERID --output=json | ConvertFrom-Json)[0].id
+          
+          echo "ARTIFACT_ID=$artifactId" >> $env:GITHUB_ENV
+          
+          fcli ssc artifact approve $artifactId
+        shell: powershell
+
+      - name: Download Fortify Report
+        run: |
+          Write-Host "Downloading Fortify Report for Artifact ID: ${{env.ARTIFACT_ID}}"
+          fcli ssc artifact download ${{env.ARTIFACT_ID}} -f ${{env.FORTIFY_BUILD}}.fpr
+          
+      - name: Upload FPR Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fortify-fpr
+          path: ${{vars.FORTIFY_BUILD}}.fpr
+
+      - name: Run Github-SAST-Report
+        run: |
+          fcli ssc action run github-sast-report --appversion $env:FORTIFY_VERID --file ${{env.FORTIFY_BUILD}}.fpr.sarif
+
+      - name: Upload Sarif Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fortify-fpr-sarif
+          path: ${{vars.FORTIFY_BUILD}}.fpr.sarif
+
+      - name: Upload SARIF File
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{vars.FORTIFY_BUILD}}.fpr.sarif
+          category: Fortify
+          
