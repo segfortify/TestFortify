@@ -10,7 +10,7 @@ on:
 
 jobs:
   Scan_Fortify:
-   runs-on: self-hosted
+    runs-on: self-hosted
  
     env:
       FORTIFY_SSC_URL: ${{ vars.FORTIFY_SSC_URL }}  #https://<hostname>:8443/ssc/
